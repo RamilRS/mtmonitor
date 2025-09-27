@@ -1,18 +1,16 @@
 # app/main.py
 from fastapi import HTTPException
 from pydantic import BaseModel
-from datetime import datetime
-from app.models import Base, engine
-from app.bot import build_bot
+from datetime import datetime, timezone
+from app.models import Base, engine, SessionLocal, User, LastSnapshot, SymbolSnapshot, Account
+from app.bot import build_bot, send_queued_message, message_worker
 from dotenv import load_dotenv
 from pathlib import Path
-import threading, os, asyncio
+import os, asyncio
 from typing import Dict, Optional
 from fastapi import FastAPI, Request, Header, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import select
-from app.models import SessionLocal, User, LastSnapshot, SymbolSnapshot, Account
-from datetime import timezone
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=True)
@@ -23,14 +21,10 @@ app = FastAPI(title="FXMonitor Local")
 # глобальная переменная для телеграм-бота
 tg_app = None
 
-#def _run_bot():
-#    tg_app = build_bot()
-#    loop = asyncio.new_event_loop()
-#    asyncio.set_event_loop(loop)
-#    loop.run_until_complete(tg_app.run_polling(drop_pending_updates=True))
-#
-#threading.Thread(target=_run_bot, daemon=True).start()
 
+# ==========================
+# Pydantic модели
+# ==========================
 class SymbolData(BaseModel):
     price: float
     dd_percent: float
@@ -38,6 +32,7 @@ class SymbolData(BaseModel):
     buy_count: int
     sell_lots: float
     sell_count: int
+
 
 class Ingest(BaseModel):
     account_id: int
@@ -48,6 +43,10 @@ class Ingest(BaseModel):
     balance: float | None = None
     symbols: Optional[Dict[str, SymbolData]] = None
 
+
+# ==========================
+# /ingest
+# ==========================
 @app.post("/ingest")
 async def ingest(p: Ingest, request: Request, x_api_key: str = Header(default=None)):
     if not x_api_key:
@@ -75,34 +74,22 @@ async def ingest(p: Ingest, request: Request, x_api_key: str = Header(default=No
             s.add(acc)
             s.commit()
 
-            # уведомляем пользователя и показываем меню со счетами
-            from telegram import Bot
-            from app.bot import cmd_accounts_menu
-            from telegram.ext import ContextTypes
+            # уведомляем пользователя и показываем меню
+            if u and u.chat_id:
+                # сообщение в очередь
+                await send_queued_message(
+                    u.chat_id,
+                    f"➕ Добавлен новый счёт {p.account_id}"
+                )
 
-            BOT_TOKEN = os.getenv("BOT_TOKEN")
-            if BOT_TOKEN and u and u.chat_id:
-                bot = Bot(token=BOT_TOKEN)
-
-                import asyncio
-
-                async def notify():
-                    try:
-                        await bot.send_message(
-                            chat_id=u.chat_id,
-                            text=f"➕ Добавлен новый счёт {p.account_id}"
-                        )
-                        # сразу вывести меню
-                        fake_update = type(
-                            "obj",
-                            (object,),
-                            {"effective_chat": type("obj2", (object,), {"id": u.chat_id})()}
-                        )()
-                        await cmd_accounts_menu(fake_update, ContextTypes.DEFAULT_TYPE())
-                    except Exception as e:
-                        print(f"Ошибка отправки уведомления в Telegram: {e}")
-
-                asyncio.create_task(notify())
+                # вызвать меню аккаунтов
+                from app.bot import cmd_accounts_menu, ContextTypes
+                fake_update = type(
+                    "obj",
+                    (object,),
+                    {"effective_chat": type("obj2", (object,), {"id": u.chat_id})()}
+                )()
+                asyncio.create_task(cmd_accounts_menu(fake_update, ContextTypes.DEFAULT_TYPE()))
 
         # обновляем/создаём LastSnapshot
         snap = s.scalar(
@@ -124,7 +111,10 @@ async def ingest(p: Ingest, request: Request, x_api_key: str = Header(default=No
         s.commit()
 
         # 🔹 всегда очищаем старые символы по счёту
-        s.query(SymbolSnapshot).filter(SymbolSnapshot.api_key == x_api_key,SymbolSnapshot.account_id == p.account_id).delete()
+        s.query(SymbolSnapshot).filter(
+            SymbolSnapshot.api_key == x_api_key,
+            SymbolSnapshot.account_id == p.account_id
+        ).delete()
         s.commit()
 
         # 🔹 добавляем новые символы, если есть
@@ -146,6 +136,10 @@ async def ingest(p: Ingest, request: Request, x_api_key: str = Header(default=No
 
     return {"status": "ok"}
 
+
+# ==========================
+# /api/status
+# ==========================
 @app.get("/api/status")
 async def api_status(x_api_key: str = Header(default=None)):
     if not x_api_key:
@@ -209,10 +203,14 @@ async def api_status(x_api_key: str = Header(default=None)):
         return JSONResponse(result)
 
 
+# ==========================
+# CRUD для Account
+# ==========================
 class AccountData(BaseModel):
     account_id: str
     name: str
     is_cent: bool = False
+
 
 @app.post("/api/add_account")
 async def add_account(acc: AccountData, x_api_key: str = Header(default=None)):
@@ -242,6 +240,7 @@ async def add_account(acc: AccountData, x_api_key: str = Header(default=None)):
         s.commit()
         return {"status": "ok", "account_id": new_acc.account_id}
 
+
 @app.get("/api/accounts")
 async def list_accounts(x_api_key: str = Header(default=None)):
     if not x_api_key:
@@ -253,9 +252,11 @@ async def list_accounts(x_api_key: str = Header(default=None)):
             for a in accounts
         ]
 
+
 class AccountUpdate(BaseModel):
     name: str | None = None
     is_cent: bool | None = None
+
 
 @app.post("/api/update_account")
 async def update_account(acc: AccountUpdate, account_id: str, x_api_key: str = Header(default=None)):
@@ -417,28 +418,37 @@ async def web(api_key: str = Query(...)):
 
 @app.get("/w/{short_id}")
 async def web_short(short_id: str):
-    from sqlalchemy import select
     with SessionLocal() as s:
         u = s.scalar(select(User).where(User.short_id == short_id))
         if not u:
             raise HTTPException(status_code=404, detail="Not found")
     return await web(api_key=u.api_key)
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "fx_monitor is running"}
 
-# ---------------------- Telegram Bot ----------------------
 
+# ==========================
+# Telegram Bot lifecycle
+# ==========================
 @app.on_event("startup")
 async def start_bot():
     global tg_app
     tg_app = build_bot()
 
-    # инициализация и запуск асинхронно
     await tg_app.initialize()
     await tg_app.start()
     await tg_app.updater.start_polling(drop_pending_updates=True)
+
+    # 🔹 запускаем фоновый воркер для очереди сообщений
+    from telegram import Bot
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    if BOT_TOKEN:
+        bot = Bot(BOT_TOKEN)
+        asyncio.create_task(message_worker(bot))
+
 
 @app.on_event("shutdown")
 async def stop_bot():
