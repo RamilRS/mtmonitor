@@ -20,13 +20,16 @@ load_dotenv(ROOT / ".env", override=True)
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="FXMonitor Local")
 
-def _run_bot():
-    tg_app = build_bot()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(tg_app.run_polling(drop_pending_updates=True))
+# глобальная переменная для телеграм-бота
+tg_app = None
 
-threading.Thread(target=_run_bot, daemon=True).start()
+#def _run_bot():
+#    tg_app = build_bot()
+#    loop = asyncio.new_event_loop()
+#    asyncio.set_event_loop(loop)
+#    loop.run_until_complete(tg_app.run_polling(drop_pending_updates=True))
+#
+#threading.Thread(target=_run_bot, daemon=True).start()
 
 class SymbolData(BaseModel):
     price: float
@@ -281,9 +284,10 @@ async def web(api_key: str = Query(...)):
     <html>
     <head>
         <title>MTMonitor Web</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body {{ font-family: Arial, sans-serif; background:#f5f7fa; margin:0; padding:0; }}
-            .header {{ background:#003366; color:#fff; padding:12px; font-size:20px; font-weight:bold; }}
+            .header {{ background:#003366; color:#fff; padding:12px; font-size:20px; font-weight:bold; text-align:center; }}
             .account-card {{
                 background:#fff; margin:15px; padding:20px; border-radius:8px;
                 box-shadow:0 2px 5px rgba(0,0,0,0.2);
@@ -317,6 +321,23 @@ async def web(api_key: str = Query(...)):
             .dd {{ font-size:14px; margin-bottom:4px; }}
             .stat-small {{ font-size:12px; font-weight:normal; }}
             .footer {{ margin-top:15px; font-size:12px; color:#555; text-align:center; }}
+
+            /* 🔹 Мобильная версия */
+            @media (max-width: 600px) {{
+                .row {{ flex-direction:column; align-items:flex-start; gap:6px; line-height:1.2; }}
+                .big-red, .big-green {{ font-size:16px; }}
+                .tile-row {{ display:grid; grid-template-columns: repeat(2, 1fr); gap:10px; }}
+                .tile {{ padding:10px; font-size:20px; display:flex; flex-direction:column; justify-content:center; }}
+                .tile span.label {{ font-size:12px; font-weight:normal; margin-bottom:4px; display:block; }}
+                .tile span.value {{ font-size:22px; font-weight:bold; }}
+                .symbols-grid {{ grid-template-columns: repeat(4, 1fr); gap:1px; }}
+                .symbol {{ padding:4px; font-size:14px; }}
+                .symbol-name {{ font-size:13px; }}
+                .price-box {{ font-size:16px; }}
+                .dd {{ font-size:16px; margin-bottom:2px; }}   /* 🔹 Просадка крупнее */
+                .stat-small {{ font-size:11px; }}
+                .day-week-month {{ font-size:14px; margin-top:8px; }}
+            }}
         </style>
     </head>
     <body>
@@ -332,9 +353,6 @@ async def web(api_key: str = Query(...)):
                 }}
                 let data = await res.json();
 
-                // 🔹 сортировка по имени
-                data.sort((a, b) => a.account_name.localeCompare(b.account_name));
-
                 data.sort((a, b) => {{
                     if (a.symbols.length > 0 && b.symbols.length === 0) return -1;
                     if (a.symbols.length === 0 && b.symbols.length > 0) return 1;
@@ -345,18 +363,22 @@ async def web(api_key: str = Query(...)):
                 for (let acc of data) {{
                     html += `<div class="account-card">
                         <div class="row">
-                            <div><b>Account:</b> ${{acc.account_name}}</div>
+                            <div>Account: <b>${{acc.account_name}}</b></div>
                             <div class="${{acc.drawdown<0?'big-red':'big-green'}}">Drawdown: ${{acc.drawdown.toFixed(2)}}%</div>
                             <div class="big-green">Margin: ${{acc.margin_level?.toFixed(2) ?? "-"}}%</div>
                         </div>
                         <div class="tile-row">
-                            <div class="tile">Balance<br>${{acc.balance?.toFixed(2) ?? "-"}}</div>
-                            <div class="tile">Equity<br>${{acc.equity?.toFixed(2) ?? "-"}}</div>
+                            <div class="tile">
+                                <span class="label">Balance</span>
+                                <span class="value">${{acc.balance?.toFixed(2) ?? "-"}} $</span>
+                            </div>
+                            <div class="tile">
+                                <span class="label">Equity</span>
+                                <span class="value">${{acc.equity?.toFixed(2) ?? "-"}} $</span>
+                            </div>
                         </div>
-                        <div class="row">
-                            <div>Day: <b>${{acc.pnl_daily?.toFixed(2) ?? "-"}}</b></div>
-                            <div>Week: <b>—</b></div>
-                            <div>Month: <b>—</b></div>
+                        <div class="row day-week-month">
+                            <div>Day: <b>${{acc.pnl_daily?.toFixed(2) ?? "-"}}</b> | Week: <b>—</b> | Month: <b>—</b></div>
                         </div>`;
 
                     if (acc.symbols && acc.symbols.length > 0) {{
@@ -366,7 +388,6 @@ async def web(api_key: str = Query(...)):
                             if (s.dd_percent <= -25) cls = "symbol red";
                             else if (s.dd_percent <= -10) cls = "symbol orange";
                             else if (s.dd_percent < -1) cls = "symbol yellow";
-                            else cls = "symbol green";
 
                             html += `<div class="${{cls}}">
                                 <div class="symbol-name">${{s.symbol}}</div>
@@ -394,3 +415,35 @@ async def web(api_key: str = Query(...)):
     """
     return HTMLResponse(content=html)
 
+@app.get("/w/{short_id}")
+async def web_short(short_id: str):
+    from sqlalchemy import select
+    with SessionLocal() as s:
+        u = s.scalar(select(User).where(User.short_id == short_id))
+        if not u:
+            raise HTTPException(status_code=404, detail="Not found")
+    return await web(api_key=u.api_key)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "fx_monitor is running"}
+
+# ---------------------- Telegram Bot ----------------------
+
+@app.on_event("startup")
+async def start_bot():
+    global tg_app
+    tg_app = build_bot()
+
+    # инициализация и запуск асинхронно
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling(drop_pending_updates=True)
+
+@app.on_event("shutdown")
+async def stop_bot():
+    global tg_app
+    if tg_app:
+        await tg_app.updater.stop()
+        await tg_app.stop()
+        await tg_app.shutdown()

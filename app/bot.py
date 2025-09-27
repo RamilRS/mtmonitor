@@ -13,7 +13,7 @@ from telegram.ext import (
 from sqlalchemy import select, delete
 from app.models import SessionLocal, User, Account, LastSnapshot, SymbolSnapshot
 from tzlocal import get_localzone
-
+import secrets
 
 def get_drawdown_color(dd: float) -> str:
     if dd < -5:
@@ -32,7 +32,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as s:
         u = s.scalar(select(User).where(User.chat_id == chat_id))
         if not u:
-            u = User(chat_id=chat_id, api_key=os.urandom(16).hex())
+            u = User(
+                chat_id=chat_id,
+                api_key=os.urandom(16).hex(),
+                short_id=secrets.token_urlsafe(8)  # NEW
+            )
             s.add(u)
             s.commit()
     await cmd_accounts_menu(update, context)
@@ -76,13 +80,13 @@ async def cmd_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton(label, callback_data=f"acc:{acc.account_id}")]
             )
 
+        host = os.getenv("WEB_HOST", "mtmonitor.ru:8000")
+        scheme = "http"
+        web_url = f"{scheme}://{host}/w/{u.short_id}"
         buttons.append(
             [
                 InlineKeyboardButton("📊 Статус", callback_data="showstatus"),
-                InlineKeyboardButton(
-                    "🌐 Web",
-                    url=f"http://127.0.0.1:8000/web?api_key={u.api_key}",
-                ),
+                InlineKeyboardButton("🌐 Web", url=web_url),
                 InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
             ]
         )
@@ -144,11 +148,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 .where(Account.account_id == snap.account_id)
             )
 
+            factor = 0.01 if acc and acc.is_cent else 1.0
+            # формируем заголовок
+            if acc and acc.name and acc.name != str(snap.account_id):
+                acc_header = f"📊 Статус счёта <b>{acc.name}</b> ({snap.account_id})\n"
+            else:
+                acc_header = f"📊 Статус счёта <b>{acc.name}</b>\n"
+
             text += (
-                f"📊 Статус счёта {snap.account_id} ({acc.name})\n"
+                acc_header +
                 f"Центовый: {'Да' if acc.is_cent else 'Нет'}\n"
-                f"Equity: {snap.equity:.2f}\n"
-                f"Balance: {snap.balance:.2f}\n"
+                f"Equity: <b>${snap.equity * factor:.2f}</b>\n"
+                f"Balance: <b>${snap.balance * factor:.2f}</b>\n"
                 f"Margin Level: {snap.margin_level:.2f}%\n"
                 f"Просадка по счёту: {dd_account:.2f}%\n"
                 f"Обновлено: {local_time:%Y-%m-%d %H:%M:%S}\n"
@@ -163,8 +174,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"{sym.symbol:<6} "
                         f"{sym.price:<6.5f} "
                         f"{sym.dd_percent:+7.2f}% "
-                        f"{sym.buy_lots:>5.2f}/{sym.buy_count:<1}🟢"
-                        f"{sym.sell_lots:>5.2f}/{sym.sell_count:<1}🔻\n"
+                        f"{sym.buy_lots:>5.2f}/{sym.buy_count:<1}▲"
+                        f"{sym.sell_lots:>5.2f}/{sym.sell_count:<1}▼\n"
                     )
                 text += "</pre>\n"
             else:
@@ -328,7 +339,7 @@ async def callback_sendexpert(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Build bot
 # ==========================
 def build_bot() -> Application:
-    load_dotenv(override=True)
+    load_dotenv("config.env", override=True)
     token = os.getenv("BOT_TOKEN")
     if not token or ":" not in token:
         raise RuntimeError("BOT_TOKEN не найден или неверный. Проверь .env (BOT_TOKEN=...)")

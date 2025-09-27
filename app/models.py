@@ -13,6 +13,7 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     chat_id = Column(String, unique=True, index=True, nullable=False)
     api_key = Column(String, unique=True, index=True, nullable=False)
+    short_id = Column(String, unique=True, index=True, nullable=True)
     min_equity = Column(Float, nullable=True)
     min_ml = Column(Float, nullable=True)
     max_daily_loss = Column(Float, nullable=True)
