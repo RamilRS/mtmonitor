@@ -1,5 +1,8 @@
 import os
 import asyncio
+import secrets
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
@@ -14,31 +17,53 @@ from telegram.ext import (
 from sqlalchemy import select, delete
 from app.models import SessionLocal, User, Account, LastSnapshot, SymbolSnapshot
 from tzlocal import get_localzone
-import secrets
 
 
 # ==========================
-# Очередь сообщений
+# Очередь сообщений с контролем лимитов
 # ==========================
 message_queue = asyncio.Queue()
+sent_timestamps = deque()         # лимит 30/сек
+user_timestamps = {}              # лимит 20/мин на пользователя
 
 
 async def message_worker(bot: Bot):
     """Фоновая задача для отправки сообщений с учётом лимитов Telegram."""
+    global sent_timestamps, user_timestamps
     while True:
+        chat_id, text, kwargs = await message_queue.get()
         try:
-            chat_id, text, kwargs = await message_queue.get()
-            try:
-                await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-            except Exception as e:
-                print(f"[MessageWorker] Ошибка отправки: {e}")
-            finally:
-                message_queue.task_done()
+            now = time.time()
 
-            await asyncio.sleep(0.05)  # не более ~20 msg/сек
+            # --- лимит 30/сек ---
+            while sent_timestamps and now - sent_timestamps[0] > 1:
+                sent_timestamps.popleft()
+            if len(sent_timestamps) >= 29:
+                wait_time = 1 - (now - sent_timestamps[0])
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+
+            # --- лимит 20/мин на пользователя ---
+            if chat_id not in user_timestamps:
+                user_timestamps[chat_id] = deque()
+            while user_timestamps[chat_id] and now - user_timestamps[chat_id][0] > 60:
+                user_timestamps[chat_id].popleft()
+            if len(user_timestamps[chat_id]) >= 19:
+                wait_time = 60 - (now - user_timestamps[chat_id][0])
+                if wait_time > 0:
+                    print(f"[RateLimit] Задержка {wait_time:.2f}с для chat_id={chat_id}")
+                    await asyncio.sleep(wait_time)
+
+            # --- отправка ---
+            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+            sent_timestamps.append(time.time())
+            user_timestamps[chat_id].append(time.time())
+
         except Exception as e:
-            print(f"[MessageWorker] Критическая ошибка: {e}, перезапуск...")
-            await asyncio.sleep(1)
+            print(f"[MessageWorker] Ошибка отправки: {e}")
+        finally:
+            message_queue.task_done()
 
 
 async def send_queued_message(chat_id: str, text: str, **kwargs):
@@ -210,6 +235,186 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================
+# Колбэки для кнопок
+# ==========================
+async def callback_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    account_id = query.data.split(":")[1]
+
+    with SessionLocal() as s:
+        acc = s.scalar(select(Account).where(Account.account_id == account_id))
+        text = (
+            f"Счёт {acc.account_id}: {acc.name}\n"
+            f"Центовый: {'Да' if acc.is_cent else 'Нет'}"
+        )
+
+        buttons = [
+            [InlineKeyboardButton("🔤 Переименовать", callback_data=f"rename:{account_id}")],
+            [InlineKeyboardButton(
+                "💰 Сделать обычным" if acc.is_cent else "💵 Сделать центовым",
+                callback_data=f"togglecent:{account_id}"
+            )],
+            [InlineKeyboardButton("🗑 Удалить счёт", callback_data=f"delete:{account_id}")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="backtomain")],
+        ]
+
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def callback_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+
+    if data == "showstatus":
+        await cmd_status(update, context)
+        await cmd_accounts_menu(update, context)
+
+    elif data == "settings":
+        settings_buttons = [
+            [InlineKeyboardButton("➕ Добавить счёт", callback_data="addaccount")],
+            [InlineKeyboardButton("💳 Оплата", callback_data="payment")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="backtomain")],
+        ]
+        await query.message.reply_text(
+            "⚙️ Настройки:", reply_markup=InlineKeyboardMarkup(settings_buttons)
+        )
+
+    elif data == "backtomain":
+        await cmd_accounts_menu(update, context)
+
+    elif data == "payment":
+        await query.message.reply_text("💳 Для вас 3 месяца бесплатного пользования 🚀")
+        await cmd_accounts_menu(update, context)
+
+    elif data.startswith("rename:"):
+        account_id = data.split(":")[1]
+        context.user_data["rename_account"] = account_id
+        await query.message.reply_text("Введите новое имя для счёта:")
+
+    elif data.startswith("togglecent:"):
+        account_id = data.split(":")[1]
+        with SessionLocal() as s:
+            acc = s.scalar(select(Account).where(Account.account_id == account_id))
+            if acc:
+                acc.is_cent = not acc.is_cent
+                s.commit()
+                status = "Центовый" if acc.is_cent else "Обычный"
+                await query.message.reply_text(f"✅ Счёт {acc.name} теперь {status}")
+            else:
+                await query.message.reply_text("❌ Счёт не найден")
+        await cmd_accounts_menu(update, context)
+
+    elif data.startswith("delete:"):
+        account_id_str = data.split(":")[1]
+        try:
+            account_id = int(account_id_str)
+        except ValueError:
+            await update.callback_query.answer("Неверный ID счёта", show_alert=True)
+            return
+
+        chat_id = str(update.effective_chat.id)
+        with SessionLocal() as s:
+            u = s.scalar(select(User).where(User.chat_id == chat_id))
+            if not u:
+                await update.callback_query.answer("Сначала /start", show_alert=True)
+                return
+
+            acc = s.scalar(
+                select(Account)
+                .where(Account.api_key == u.api_key)
+                .where(Account.account_id == account_id)
+            )
+            if not acc:
+                await update.callback_query.answer("Счёт не найден", show_alert=True)
+                return
+
+            s.execute(
+                delete(SymbolSnapshot)
+                .where(SymbolSnapshot.api_key == u.api_key)
+                .where(SymbolSnapshot.account_id == account_id)
+            )
+            s.execute(
+                delete(LastSnapshot)
+                .where(LastSnapshot.api_key == u.api_key)
+                .where(LastSnapshot.account_id == account_id)
+            )
+            s.delete(acc)
+            s.commit()
+
+        await update.callback_query.answer("Счёт удалён")
+        await update.callback_query.message.reply_text("🗑 Счёт удалён")
+        await cmd_accounts_menu(update, context)
+
+
+async def handle_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    if "rename_account" not in context.user_data:
+        return
+
+    account_id = context.user_data.pop("rename_account")
+    new_name = update.message.text.strip()
+
+    with SessionLocal() as s:
+        acc = s.scalar(select(Account).where(Account.account_id == account_id))
+        if acc:
+            acc.name = new_name
+            s.commit()
+            await send_queued_message(chat_id, f"✅ Счёт {account_id} переименован в «{new_name}»")
+        else:
+            await send_queued_message(chat_id, "❌ Счёт не найден")
+
+
+async def callback_addaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = str(update.effective_chat.id)
+
+    with SessionLocal() as s:
+        u = s.scalar(select(User).where(User.chat_id == chat_id))
+        if not u:
+            await query.message.reply_text("Сначала /start")
+            return
+
+        instruction = f"""
+<b>➕ Как добавить новый счёт:</b>
+
+1️⃣ Скачайте эксперта <b>MTMonitor</b> (ниже кнопка «📥 Скачать эксперта»).
+
+2️⃣ Скопируйте файл <code>mtmonitor.mq4</code> в папку <b>MQL4/Experts</b> вашего терминала MetaTrader 4.
+▫ В MetaTrader: <i>Файл → Открыть каталог данных → MQL4 → Experts</i>
+
+3️⃣ Перезапустите MetaTrader или обновите список экспертов.
+
+4️⃣ Перетащите советника <b>MTMonitor</b> на график любого <u>неиспользуемого инструмента</u>.
+
+5️⃣ В настройках советника:
+▫ Введите ваш <b>API-ключ</b>:
+<pre>{u.api_key}</pre>
+▫ Обязательно включите опцию <b>«Разрешить импорт функций DLL»</b>.
+
+6️⃣ Нажмите <b>ОК</b> — эксперт начнёт отправлять данные на сервер.
+
+7️⃣ После первой отправки счёт появится в списке в боте и на веб-панели.
+"""
+
+        buttons = [
+            [InlineKeyboardButton("📥 Скачать эксперта", callback_data="sendexpert")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="backtomain")]
+        ]
+
+        await query.message.reply_html(instruction, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def callback_sendexpert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    file_path = os.path.join(os.path.dirname(__file__), "mtmonitor.mq4")
+
+    try:
+        await query.message.reply_document(document=open(file_path, "rb"), filename="mtmonitor.mq4")
+    except Exception as e:
+        await query.message.reply_text(f"Ошибка при отправке файла: {e}")
+
+
+# ==========================
 # Build bot
 # ==========================
 def build_bot() -> Application:
@@ -225,8 +430,15 @@ def build_bot() -> Application:
     app.add_handler(CommandHandler("accounts", cmd_accounts_menu))
     app.add_handler(CommandHandler("setaccount", lambda u, c: None))
 
-    app.add_handler(CallbackQueryHandler(cmd_accounts_menu, pattern="^acc:"))
-    app.add_handler(CallbackQueryHandler(cmd_status, pattern="^showstatus$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: None))
+    app.add_handler(CallbackQueryHandler(callback_accounts, pattern="^acc:"))
+    app.add_handler(
+        CallbackQueryHandler(
+            callback_actions,
+            pattern="^(rename:|togglecent:|delete:|showstatus|settings|backtomain|payment$)",
+        )
+    )
+    app.add_handler(CallbackQueryHandler(callback_addaccount, pattern="^addaccount$"))
+    app.add_handler(CallbackQueryHandler(callback_sendexpert, pattern="^sendexpert$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename))
 
     return app
