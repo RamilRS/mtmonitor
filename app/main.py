@@ -503,27 +503,57 @@ async def web_page(short_id: str):
             }})
             .catch(err => console.error("Initial fetch error:", err));
 
-            // 🔹 Подключаем SSE для обновлений
-            const evtSource = new EventSource("/stream/{short_id}");
+            let evtSource = null;
 
-            evtSource.addEventListener("update", function(e) {{
-                console.log("SSE update:", e.data);
-                try {{
-                    let data = JSON.parse(e.data);
-                    render(data);
-                }} catch (err) {{
-                    console.error("JSON parse error:", err, e.data);
+            function connectSSE() {{
+                if (evtSource) evtSource.close();
+                evtSource = new EventSource("/stream/{short_id}");
+
+                evtSource.addEventListener("update", function(e) {{
+                    console.log("SSE update:", e.data);
+                    try {{
+                        let data = JSON.parse(e.data);
+                        render(data);
+                    }} catch (err) {{
+                        console.error("JSON parse error:", err, e.data);
+                    }}
+                }});
+
+                evtSource.addEventListener("ping", function(e) {{
+                    console.log("SSE ping:", e.data);
+                }});
+
+                evtSource.onerror = function(err) {{
+                    console.error("SSE error", err);
+                    if (evtSource) {{
+                        evtSource.close();
+                        evtSource = null;
+                    }}
+                    // пробуем переподключиться через 5 секунд, если вкладка активна
+                    setTimeout(() => {{
+                        if (!document.hidden) {{
+                            console.log("Retrying SSE connection...");
+                            connectSSE();
+                        }}
+                    }}, 5000);
+                }};
+
+            }}
+
+            document.addEventListener("visibilitychange", () => {{
+                if (document.hidden) {{
+                    if (evtSource) {{
+                        console.log("Page hidden → closing SSE");
+                        evtSource.close();
+                        evtSource = null;
+                    }}
+                }} else {{
+                    console.log("Page visible → reconnecting SSE");
+                    connectSSE();
                 }}
             }});
 
-            evtSource.addEventListener("ping", function(e) {{
-                console.log("SSE ping:", e.data);
-            }});
-
-            evtSource.onerror = function(err) {{
-                console.error("SSE error", err);
-                document.getElementById("content").innerHTML = "❌ Connection lost. Refresh page.";
-            }};
+            connectSSE();
 
             function render(data) {{
                 if (!Array.isArray(data)) {{
