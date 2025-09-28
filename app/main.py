@@ -102,7 +102,7 @@ async def ingest(p: Ingest, request: Request, x_api_key: str = Header(default=No
                     (object,),
                     {"effective_chat": type("obj2", (object,), {"id": u.chat_id})()}
                 )()
-                asyncio.create_task(cmd_accounts_menu(fake_update, ContextTypes.DEFAULT_TYPE()))
+                asyncio.create_task(cmd_accounts_menu(fake_update, None))
 
         # обновляем/создаём LastSnapshot
         snap = s.scalar(
@@ -437,6 +437,8 @@ async def web_page(short_id: str):
             u.last_web_seen = now
             s.commit()
 
+        api_key = u.api_key
+
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -504,7 +506,7 @@ async def web_page(short_id: str):
         <script>
             // 🔹 Сразу загружаем начальные данные
             fetch("/api/status", {{
-                headers: {{"X-API-KEY": "{u.api_key}"}}
+                headers: {{"X-API-KEY": "{api_key}"}}
             }})
             .then(resp => resp.json())
             .then(data => {{
