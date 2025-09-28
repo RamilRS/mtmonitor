@@ -6,11 +6,13 @@ from app.models import Base, engine, SessionLocal, User, LastSnapshot, SymbolSna
 from app.bot import build_bot, send_queued_message, message_worker
 from dotenv import load_dotenv
 from pathlib import Path
-import os, asyncio
+import os, asyncio, json
 from typing import Dict, Optional
 from fastapi import FastAPI, Request, Header, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import select
+from sse_starlette.sse import EventSourceResponse
+from app.logger import logger
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=True)
@@ -18,9 +20,11 @@ load_dotenv(ROOT / ".env", override=True)
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="FXMonitor Local")
 
+# 🔹 список подписчиков SSE
+subscribers: dict[str, list[asyncio.Queue]] = {}
+
 # глобальная переменная для телеграм-бота
 tg_app = None
-
 
 # ==========================
 # Pydantic модели
@@ -43,6 +47,14 @@ class Ingest(BaseModel):
     balance: float | None = None
     symbols: Optional[Dict[str, SymbolData]] = None
 
+# ==========================
+# SSE push helper
+# ==========================
+async def push_update(short_id: str, data: str):
+    queues = subscribers.get(short_id, [])
+    logger.info(f"[PUSH_UPDATE] short_id={short_id}, subscribers={len(queues)}")
+    for q in list(queues):
+        await q.put(data)
 
 # ==========================
 # /ingest
@@ -134,6 +146,54 @@ async def ingest(p: Ingest, request: Request, x_api_key: str = Header(default=No
                 s.add(rec)
             s.commit()
 
+        # 🔹 сразу пушим обновления в SSE
+        snaps = s.scalars(
+            select(LastSnapshot)
+            .where(LastSnapshot.api_key == x_api_key)
+            .order_by(LastSnapshot.last_seen.desc())
+        ).all()
+
+        result = []
+        for snap in snaps:
+            acc = s.scalar(
+                select(Account)
+                .where(Account.api_key == x_api_key)
+                .where(Account.account_id == snap.account_id)
+            )
+            factor = 0.01 if (acc and acc.is_cent) else 1.0
+            acc_name = acc.name if (acc and acc.name) else str(snap.account_id)
+            dd_account = ((snap.balance - snap.equity) / snap.balance * 100) if snap.balance else 0
+            symbols = s.scalars(
+                select(SymbolSnapshot)
+                .where(SymbolSnapshot.api_key == x_api_key)
+                .where(SymbolSnapshot.account_id == snap.account_id)
+            ).all()
+            result.append({
+                "account_id": snap.account_id,
+                "account_name": acc_name,
+                "equity": snap.equity * factor,
+                "balance": snap.balance * factor,
+                "margin_level": snap.margin_level,
+                "pnl_daily": snap.pnl_daily * factor,
+                "drawdown": dd_account,
+                "last_seen": snap.last_seen.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z") if snap.last_seen else None,
+                "symbols": [
+                    {
+                        "symbol": sym.symbol,
+                        "price": sym.price,
+                        "dd_percent": sym.dd_percent,
+                        "buy_lots": sym.buy_lots,
+                        "buy_count": sym.buy_count,
+                        "sell_lots": sym.sell_lots,
+                        "sell_count": sym.sell_count,
+                    }
+                    for sym in symbols
+                ]
+            })
+
+        asyncio.create_task(push_update(u.short_id, json.dumps(result)))
+        logger.info(f"[INGEST] pushed update for api_key={x_api_key}, accounts={len(result)}")
+
     return {"status": "ok"}
 
 
@@ -201,6 +261,88 @@ async def api_status(x_api_key: str = Header(default=None)):
         # сортируем: сначала с позициями, потом пустые, внутри по имени
         result.sort(key=lambda x: (0 if len(x["symbols"]) > 0 else 1, x["account_name"].lower()))
         return JSONResponse(result)
+
+# ==========================
+# SSE endpoint
+# ==========================
+@app.get("/stream/{short_id}")
+async def stream_short(short_id: str, request: Request):
+    with SessionLocal() as s:
+        u = s.scalar(select(User).where(User.short_id == short_id))
+        if not u:
+            raise HTTPException(404, "Not found")
+        api_key = u.api_key
+
+        # 🔹 сразу берём последние снапшоты и отправляем первичный апдейт
+        snaps = s.scalars(
+            select(LastSnapshot)
+            .where(LastSnapshot.api_key == api_key)
+            .order_by(LastSnapshot.last_seen.desc())
+        ).all()
+
+        result = []
+        for snap in snaps:
+            acc = s.scalar(
+                select(Account)
+                .where(Account.api_key == api_key)
+                .where(Account.account_id == snap.account_id)
+            )
+            factor = 0.01 if (acc and acc.is_cent) else 1.0
+            acc_name = acc.name if (acc and acc.name) else str(snap.account_id)
+            dd_account = ((snap.balance - snap.equity) / snap.balance * 100) if snap.balance else 0
+            symbols = s.scalars(
+                select(SymbolSnapshot)
+                .where(SymbolSnapshot.api_key == api_key)
+                .where(SymbolSnapshot.account_id == snap.account_id)
+            ).all()
+            result.append({
+                "account_id": snap.account_id,
+                "account_name": acc_name,
+                "equity": snap.equity * factor,
+                "balance": snap.balance * factor,
+                "margin_level": snap.margin_level,
+                "pnl_daily": snap.pnl_daily * factor,
+                "drawdown": dd_account,
+                "last_seen": snap.last_seen.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+                "symbols": [
+                    {
+                        "symbol": sym.symbol,
+                        "price": sym.price,
+                        "dd_percent": sym.dd_percent,
+                        "buy_lots": sym.buy_lots,
+                        "buy_count": sym.buy_count,
+                        "sell_lots": sym.sell_lots,
+                        "sell_count": sym.sell_count,
+                    }
+                    for sym in symbols
+                ]
+            })
+
+    queue: asyncio.Queue = asyncio.Queue()
+    subscribers.setdefault(short_id, []).append(queue)
+    logger.info(f"[STREAM] new subscriber short_id={short_id}, total={len(subscribers[short_id])}")
+
+    async def event_generator():
+        # 🔹 сразу шлём пинг, чтобы браузер не обрывал соединение
+        yield {"event": "ping", "data": "init"}
+
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info(f"[STREAM] disconnected short_id={short_id}")
+                    break
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield {"event": "update", "data": data}
+                    logger.info(f"[STREAM] sent update to short_id={short_id}")
+                except asyncio.TimeoutError:
+                    yield {"event": "ping", "data": "keep-alive"}
+        finally:
+            subscribers[short_id].remove(queue)
+            logger.info(f"[STREAM] removed subscriber short_id={short_id}, left={len(subscribers[short_id])}")
+
+    return EventSourceResponse(event_generator())
+
 
 
 # ==========================
@@ -278,8 +420,13 @@ async def update_account(acc: AccountUpdate, account_id: str, x_api_key: str = H
         s.commit()
         return {"status": "updated", "account_id": account.account_id}
 
-@app.get("/web")
-async def web(api_key: str = Query(...)):
+@app.get("/w/{short_id}")
+async def web_page(short_id: str):
+    with SessionLocal() as s:
+        u = s.scalar(select(User).where(User.short_id == short_id))
+        if not u:
+            raise HTTPException(404, "Not found")
+
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -335,7 +482,7 @@ async def web(api_key: str = Query(...)):
                 .symbol {{ padding:4px; font-size:14px; }}
                 .symbol-name {{ font-size:13px; }}
                 .price-box {{ font-size:16px; }}
-                .dd {{ font-size:16px; margin-bottom:2px; }}   /* 🔹 Просадка крупнее */
+                .dd {{ font-size:16px; margin-bottom:2px; }}
                 .stat-small {{ font-size:11px; }}
                 .day-week-month {{ font-size:14px; margin-top:8px; }}
             }}
@@ -343,16 +490,46 @@ async def web(api_key: str = Query(...)):
     </head>
     <body>
         <div class="header">📊 MTMonitor Web</div>
-        <div id="content">Loading...</div>
+        <div id="content"></div>
         <script>
-            const apiKey = "{api_key}";
-            async function loadData() {{
-                let res = await fetch('/api/status', {{ headers: {{"X-API-KEY": apiKey}} }});
-                if (!res.ok) {{
-                    document.getElementById("content").innerHTML = "Auth error. Проверь API key.";
+            // 🔹 Сразу загружаем начальные данные
+            fetch("/api/status", {{
+                headers: {{"X-API-KEY": "{u.api_key}"}}
+            }})
+            .then(resp => resp.json())
+            .then(data => {{
+                console.log("Initial fetch:", data);
+                render(data);
+            }})
+            .catch(err => console.error("Initial fetch error:", err));
+
+            // 🔹 Подключаем SSE для обновлений
+            const evtSource = new EventSource("/stream/{short_id}");
+
+            evtSource.addEventListener("update", function(e) {{
+                console.log("SSE update:", e.data);
+                try {{
+                    let data = JSON.parse(e.data);
+                    render(data);
+                }} catch (err) {{
+                    console.error("JSON parse error:", err, e.data);
+                }}
+            }});
+
+            evtSource.addEventListener("ping", function(e) {{
+                console.log("SSE ping:", e.data);
+            }});
+
+            evtSource.onerror = function(err) {{
+                console.error("SSE error", err);
+                document.getElementById("content").innerHTML = "❌ Connection lost. Refresh page.";
+            }};
+
+            function render(data) {{
+                if (!Array.isArray(data)) {{
+                    console.error("Unexpected data format", data);
                     return;
                 }}
-                let data = await res.json();
 
                 data.sort((a, b) => {{
                     if (a.symbols.length > 0 && b.symbols.length === 0) return -1;
@@ -406,23 +583,16 @@ async def web(api_key: str = Query(...)):
                     html += `<div class="footer">Updated: ${{acc.last_seen ? new Date(acc.last_seen).toLocaleString() : "-"}}</div>
                     </div>`;
                 }}
+
                 document.getElementById("content").innerHTML = html;
             }}
-            setInterval(loadData, 5000);
-            loadData();
         </script>
     </body>
     </html>
     """
     return HTMLResponse(content=html)
 
-@app.get("/w/{short_id}")
-async def web_short(short_id: str):
-    with SessionLocal() as s:
-        u = s.scalar(select(User).where(User.short_id == short_id))
-        if not u:
-            raise HTTPException(status_code=404, detail="Not found")
-    return await web(api_key=u.api_key)
+
 
 
 @app.get("/")

@@ -2,22 +2,23 @@ import os
 import asyncio
 import secrets
 import time
+import logging
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+Application,
+CommandHandler,
+CallbackQueryHandler,
+MessageHandler,
+ContextTypes,
+filters,
 )
 from sqlalchemy import select, delete
 from app.models import SessionLocal, User, Account, LastSnapshot, SymbolSnapshot
 from tzlocal import get_localzone
-
+from app.logger import logger
 
 # ==========================
 # Очередь сообщений с контролем лимитов
@@ -51,7 +52,7 @@ async def message_worker(bot: Bot):
             if len(user_timestamps[chat_id]) >= 19:
                 wait_time = 60 - (now - user_timestamps[chat_id][0])
                 if wait_time > 0:
-                    print(f"[RateLimit] Задержка {wait_time:.2f}с для chat_id={chat_id}")
+                    logger.info(f"[RateLimit] Задержка {wait_time:.2f}с для chat_id={chat_id}")
                     await asyncio.sleep(wait_time)
 
             # --- отправка ---
@@ -61,7 +62,7 @@ async def message_worker(bot: Bot):
             user_timestamps[chat_id].append(time.time())
 
         except Exception as e:
-            print(f"[MessageWorker] Ошибка отправки: {e}")
+            logger.info(f"[MessageWorker] Ошибка отправки: {e}")
         finally:
             message_queue.task_done()
 
