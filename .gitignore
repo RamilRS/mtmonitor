@@ -17,8 +17,8 @@ __pycache__/
 # --- Databases ---
 *.sqlite
 *.db
+fxmonitor.sqbpro
 
 # --- OS ---
 .DS_Store
 Thumbs.db
-
