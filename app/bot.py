@@ -15,10 +15,12 @@ MessageHandler,
 ContextTypes,
 filters,
 )
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from app.models import SessionLocal, User, Account, LastSnapshot, SymbolSnapshot
 from tzlocal import get_localzone
 from app.logger import logger
+
+ADMIN = "Ramil1234567"
 
 # ==========================
 # Очередь сообщений с контролем лимитов
@@ -98,6 +100,107 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s.commit()
     await cmd_accounts_menu(update, context)
 
+ADMIN = "Ramil1234567"
+
+async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.effective_user.username if update.effective_user else None
+    if username != ADMIN:
+        return await send_queued_message(str(update.effective_chat.id), "❌ Нет доступа")
+
+    with SessionLocal() as s:
+        from app.main import subscribers
+        active_pages = sum(len(v) for v in subscribers.values())
+        users_count = s.query(User).count()
+        accounts = s.query(Account).all()
+
+        # учитываем центовые счета
+        total_equity = 0
+        total_balance = 0
+        for acc in accounts:
+            snap = s.scalar(
+                select(LastSnapshot)
+                .where(LastSnapshot.api_key == acc.api_key)
+                .where(LastSnapshot.account_id == acc.account_id)
+                .order_by(LastSnapshot.last_seen.desc())
+            )
+            if not snap:
+                continue
+
+            factor = 0.01 if acc.is_cent else 1.0
+            if snap.equity:
+                total_equity += snap.equity * factor
+            if snap.balance:
+                total_balance += snap.balance * factor
+
+    text = (
+        f"📊 <b>Админ-статистика</b>\n\n"
+        f"Активных веб-страниц: {active_pages}\n"
+        f"Пользователей: {users_count}\n"
+        f"Счетов: {len(accounts)}\n"
+        f"Сумма Equity: ${total_equity:,.2f}\n"
+        f"Сумма Balance: ${total_balance:,.2f}"
+    )
+    await send_queued_message(str(update.effective_chat.id), text, parse_mode="HTML")
+    await cmd_accounts_menu(update, context)
+
+async def cmd_admin_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.effective_user.username if update.effective_user else None
+    if username != ADMIN:
+        return await send_queued_message(str(update.effective_chat.id), "❌ Нет доступа")
+
+    with SessionLocal() as s:
+        accounts = s.query(Account).all()
+
+        if not accounts:
+            return await send_queued_message(str(update.effective_chat.id), "Нет аккаунтов")
+
+        text = "📋 <b>Все аккаунты</b>\n<pre>"
+        header = (
+            f"{'User':<12}"
+            f"{'Счёт':<10}"
+            f"{'Balance':>12}"
+            f"{'Equity':>12}"
+            f"{'DD%':>8}"
+            f"{'MT обновлено':>21}"
+            f"{'WEB просмотр':>21}"
+        )
+        text += header + "\n" + "-" * len(header) + "\n"
+
+        for acc in accounts:
+            snap = s.scalar(
+                select(LastSnapshot)
+                .where(LastSnapshot.api_key == acc.api_key)
+                .where(LastSnapshot.account_id == acc.account_id)
+                .order_by(LastSnapshot.last_seen.desc())
+            )
+            last_seen = snap.last_seen.strftime("%Y-%m-%d %H:%M:%S") if snap and snap.last_seen else "—"
+
+            owner = s.scalar(select(User).where(User.api_key == acc.api_key))
+            last_web_seen = owner.last_web_seen.strftime("%Y-%m-%d %H:%M:%S") if owner and owner.last_web_seen else "—"
+
+            factor = 0.01 if acc.is_cent else 1.0
+            balance = snap.balance * factor if snap and snap.balance else 0
+            equity = snap.equity * factor if snap and snap.equity else 0
+            dd_account = ((snap.balance - snap.equity) / snap.balance * 100) if snap and snap.balance else 0
+
+            username = owner.short_id if owner else "—"
+            acc_name = (acc.name[:10]) if acc and acc.name else "—"
+
+            text += (
+                f"{username:<12}"
+                f"{acc_name:<10}"
+                f"{balance:>12.2f}"
+                f"{equity:>12.2f}"
+                f"{dd_account:>7.2f}%"
+                f"{last_seen:>21}"
+                f"{last_web_seen:>21}\n"
+            )
+
+        text += "</pre>"
+
+    await send_queued_message(str(update.effective_chat.id), text, parse_mode="HTML")
+    await cmd_accounts_menu(update, context)
+
 
 # ==========================
 # Меню счетов
@@ -147,6 +250,14 @@ async def cmd_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
             ]
         )
+
+        if update.effective_user and update.effective_user.username == ADMIN:
+            buttons.append(
+                [
+                    InlineKeyboardButton("📊 Админ-статистика", callback_data="admin_stats"),
+                    InlineKeyboardButton("📋 Аккаунты", callback_data="admin_accounts"),
+                ]
+            )
 
         reply_markup = InlineKeyboardMarkup(buttons)
         if update.callback_query:
@@ -265,10 +376,18 @@ async def callback_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+    logger.info(f"[ACTION] {data}")
 
     if data == "showstatus":
         await cmd_status(update, context)
         await cmd_accounts_menu(update, context)
+
+    # 🔹 новые условия для админа
+    elif data == "admin_stats":
+        await cmd_admin_stats(update, context)
+
+    elif data == "admin_accounts":
+        await cmd_admin_accounts(update, context)
 
     elif data == "settings":
         settings_buttons = [
@@ -307,43 +426,51 @@ async def callback_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("delete:"):
         account_id_str = data.split(":")[1]
-        try:
-            account_id = int(account_id_str)
-        except ValueError:
-            await update.callback_query.answer("Неверный ID счёта", show_alert=True)
-            return
+        logger.info(f"[DELETE] Запрос на удаление счёта {account_id_str}")
 
         chat_id = str(update.effective_chat.id)
         with SessionLocal() as s:
             u = s.scalar(select(User).where(User.chat_id == chat_id))
             if not u:
-                await update.callback_query.answer("Сначала /start", show_alert=True)
+                logger.warning(f"[DELETE] Пользователь {chat_id} не найден в users")
+                await update.callback_query.message.reply_text("❌ Сначала /start")
                 return
+
+            logger.info(f"[DELETE] Пользователь {chat_id} найден, api_key={u.api_key}")
 
             acc = s.scalar(
                 select(Account)
                 .where(Account.api_key == u.api_key)
-                .where(Account.account_id == account_id)
+                .where(Account.account_id == account_id_str)   # сравнение как строка
             )
             if not acc:
-                await update.callback_query.answer("Счёт не найден", show_alert=True)
+                logger.warning(f"[DELETE] Счёт {account_id_str} не найден у api_key={u.api_key}")
+                await update.callback_query.message.reply_text("❌ Счёт не найден")
                 return
 
-            s.execute(
+            logger.info(f"[DELETE] Найден счёт {acc.account_id}, начинаем удаление снапшотов")
+
+            # удаляем связанные снапшоты
+            deleted_symbols = s.execute(
                 delete(SymbolSnapshot)
                 .where(SymbolSnapshot.api_key == u.api_key)
-                .where(SymbolSnapshot.account_id == account_id)
-            )
-            s.execute(
+                .where(SymbolSnapshot.account_id == account_id_str)
+            ).rowcount
+            logger.info(f"[DELETE] Удалено {deleted_symbols} строк из SymbolSnapshot")
+
+            deleted_snaps = s.execute(
                 delete(LastSnapshot)
                 .where(LastSnapshot.api_key == u.api_key)
-                .where(LastSnapshot.account_id == account_id)
-            )
+                .where(LastSnapshot.account_id == account_id_str)
+            ).rowcount
+            logger.info(f"[DELETE] Удалено {deleted_snaps} строк из LastSnapshot")
+
             s.delete(acc)
+            logger.info(f"[DELETE] Удалена запись из accounts: {acc.account_id}")
             s.commit()
 
-        await update.callback_query.answer("Счёт удалён")
-        await update.callback_query.message.reply_text("🗑 Счёт удалён")
+        await update.callback_query.message.reply_text(f"🗑 Счёт {account_id_str} удалён")
+        logger.info(f"[DELETE] ✅ Счёт {account_id_str} успешно удалён")
         await cmd_accounts_menu(update, context)
 
 
@@ -430,14 +557,18 @@ def build_bot() -> Application:
     app.add_handler(CommandHandler("web", cmd_status))
     app.add_handler(CommandHandler("accounts", cmd_accounts_menu))
     app.add_handler(CommandHandler("setaccount", lambda u, c: None))
+    # 🔹 админские команды
+    app.add_handler(CommandHandler("admin_stats", cmd_admin_stats))
+    app.add_handler(CommandHandler("admin_accounts", cmd_admin_accounts))
 
     app.add_handler(CallbackQueryHandler(callback_accounts, pattern="^acc:"))
     app.add_handler(
         CallbackQueryHandler(
             callback_actions,
-            pattern="^(rename:|togglecent:|delete:|showstatus|settings|backtomain|payment$)",
+            pattern="^(rename:.*|togglecent:.*|delete:.*|showstatus|settings|backtomain|payment|admin_stats|admin_accounts)$",
         )
     )
+
     app.add_handler(CallbackQueryHandler(callback_addaccount, pattern="^addaccount$"))
     app.add_handler(CallbackQueryHandler(callback_sendexpert, pattern="^sendexpert$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename))

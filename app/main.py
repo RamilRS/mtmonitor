@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 from app.logger import logger
+from datetime import datetime, timedelta
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env", override=True)
@@ -235,13 +236,17 @@ async def api_status(x_api_key: str = Header(default=None)):
                 .where(SymbolSnapshot.account_id == snap.account_id)
             ).all()
 
+            equity = snap.equity * factor if snap.equity else 0
+            balance = snap.balance * factor if snap.balance else 0
+            pnl_daily = snap.pnl_daily * factor if snap.pnl_daily else 0
+
             result.append({
                 "account_id": snap.account_id,
                 "account_name": acc_name,
-                "equity": snap.equity * factor,
-                "balance": snap.balance * factor,
+                "equity": equity,
+                "balance": balance,
                 "margin_level": snap.margin_level,
-                "pnl_daily": snap.pnl_daily * factor,
+                "pnl_daily": pnl_daily,
                 "drawdown": dd_account,
                 "last_seen": snap.last_seen.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z") if snap.last_seen else None,
                 "symbols": [
@@ -426,6 +431,11 @@ async def web_page(short_id: str):
         u = s.scalar(select(User).where(User.short_id == short_id))
         if not u:
             raise HTTPException(404, "Not found")
+
+        now = datetime.utcnow()
+        if not u.last_web_seen or (now - u.last_web_seen) > timedelta(minutes=5):
+            u.last_web_seen = now
+            s.commit()
 
     html = f"""
     <!DOCTYPE html>

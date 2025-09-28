@@ -21,6 +21,7 @@ class User(Base):
     heartbeat_min = Column(Integer, nullable=True)
     last_alert_at = Column(DateTime, nullable=True)
     lost_conn_alerted = Column(Boolean, default=False)
+    last_web_seen = Column(DateTime, default=None)
 
 class LastSnapshot(Base):
     __tablename__ = "last_snapshots"
@@ -63,5 +64,4 @@ class Account(Base):
     account_id = Column(String, nullable=False)
     name = Column(String, nullable=True)
     is_cent = Column(Boolean, default=False)
-
     __table_args__ = (UniqueConstraint("api_key", "account_id"),)
