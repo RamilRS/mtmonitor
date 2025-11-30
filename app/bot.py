@@ -173,10 +173,9 @@ async def cmd_admin_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 .where(LastSnapshot.account_id == acc.account_id)
                 .order_by(LastSnapshot.last_seen.desc())
             )
-            last_seen = snap.last_seen.strftime("%Y-%m-%d %H:%M:%S") if snap and snap.last_seen else "—"
-
+            last_seen = snap.last_seen.replace(tzinfo=timezone.utc).astimezone(get_localzone()).strftime("%Y-%m-%d %H:%M:%S") if snap and snap.last_seen else "—"
             owner = s.scalar(select(User).where(User.api_key == acc.api_key))
-            last_web_seen = owner.last_web_seen.strftime("%Y-%m-%d %H:%M:%S") if owner and owner.last_web_seen else "—"
+            last_web_seen = owner.last_web_seen.replace(tzinfo=timezone.utc).astimezone(get_localzone()).strftime("%Y-%m-%d %H:%M:%S") if owner and owner.last_web_seen else "—"
 
             factor = 0.01 if acc.is_cent else 1.0
             balance = snap.balance * factor if snap and snap.balance else 0
@@ -238,10 +237,10 @@ async def cmd_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = f"{status_icon} {acc.name}".strip()
             buttons.append(
                 [InlineKeyboardButton(label, callback_data=f"acc:{acc.account_id}")]
-            )
+            )s
 
-        host = os.getenv("WEB_HOST", "mtmonitor.ru:8000")
-        scheme = "http"
+        host = os.getenv("WEB_HOST", "mtmonitor.ru")
+        scheme = "https"
         web_url = f"{scheme}://{host}/w/{u.short_id}"
         buttons.append(
             [
@@ -505,10 +504,10 @@ async def callback_addaccount(update: Update, context: ContextTypes.DEFAULT_TYPE
         instruction = f"""
 <b>➕ Как добавить новый счёт:</b>
 
-1️⃣ Скачайте эксперта <b>MTMonitor</b> (ниже кнопка «📥 Скачать эксперта»).
+1️⃣ Скачайте эксперта <b>MTMonitor</b> для вашего терминала (MT4 или MT5) — кнопки ниже.
 
-2️⃣ Скопируйте файл <code>mtmonitor.mq4</code> в папку <b>MQL4/Experts</b> вашего терминала MetaTrader 4.
-▫ В MetaTrader: <i>Файл → Открыть каталог данных → MQL4 → Experts</i>
+2️⃣ Скопируйте файл эксперта в папку <b>MQL4/Experts</b> (для MT4) или <b>MQL5/Experts</b> (для MT5).
+▫ В MetaTrader: <i>Файл → Открыть каталог данных → MQLx → Experts</i>
 
 3️⃣ Перезапустите MetaTrader или обновите список экспертов.
 
@@ -517,30 +516,62 @@ async def callback_addaccount(update: Update, context: ContextTypes.DEFAULT_TYPE
 5️⃣ В настройках советника:
 ▫ Введите ваш <b>API-ключ</b>:
 <pre>{u.api_key}</pre>
-▫ Обязательно включите опцию <b>«Разрешить импорт функций DLL»</b>.
+
+<b>Дополнительно:</b>
+• Для <b>MetaTrader 4</b>: включите опцию <b>«Разрешить импорт DLL»</b>.  
+• Для <b>MetaTrader 5</b>: в разделе <b>Сервис → Настройки → Советники</b> добавьте URL <code>https://mtmonitor.ru</code> в список «Разрешить WebRequest для указанных URL».
 
 6️⃣ Нажмите <b>ОК</b> — эксперт начнёт отправлять данные на сервер.
 
-7️⃣ После первой отправки счёт появится в списке в боте и на веб-панели.
+После первой отправки счёт появится в списке в боте и на веб-панели.
 """
 
         buttons = [
-            [InlineKeyboardButton("📥 Скачать эксперта", callback_data="sendexpert")],
+            [InlineKeyboardButton("📥 Скачать MT4", callback_data="sendexpert_mt4")],
+            [InlineKeyboardButton("📥 Скачать MT5", callback_data="sendexpert_mt5")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="backtomain")]
         ]
 
         await query.message.reply_html(instruction, reply_markup=InlineKeyboardMarkup(buttons))
 
-
-async def callback_sendexpert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_sendexpert_mt4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    file_path = os.path.join(os.path.dirname(__file__), "mtmonitor.mq4")
+    file_path = os.path.join(os.path.dirname(__file__), "Experts", "mtmonitor.ex4")
 
     try:
-        await query.message.reply_document(document=open(file_path, "rb"), filename="mtmonitor.mq4")
+        with open(file_path, "rb") as f:
+            await query.message.reply_document(document=f, filename="mtmonitor.ex4")
     except Exception as e:
-        await query.message.reply_text(f"Ошибка при отправке файла: {e}")
+        # 🔄 Повтор через send_document
+        try:
+            with open(file_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=f,
+                    filename="mtmonitor.ex4"
+                )
+        except Exception as e2:
+            await query.message.reply_text(f"Ошибка при отправке MT4 эксперта: {e2}")
 
+
+async def callback_sendexpert_mt5(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    file_path = os.path.join(os.path.dirname(__file__), "Experts", "mtmonitor.ex5")
+
+    try:
+        with open(file_path, "rb") as f:
+            await query.message.reply_document(document=f, filename="mtmonitor.ex5")
+    except Exception as e:
+        # 🔄 Повтор через send_document
+        try:
+            with open(file_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=f,
+                    filename="mtmonitor.ex5"
+                )
+        except Exception as e2:
+            await query.message.reply_text(f"Ошибка при отправке MT5 эксперта: {e2}")
 
 # ==========================
 # Build bot
@@ -570,7 +601,8 @@ def build_bot() -> Application:
     )
 
     app.add_handler(CallbackQueryHandler(callback_addaccount, pattern="^addaccount$"))
-    app.add_handler(CallbackQueryHandler(callback_sendexpert, pattern="^sendexpert$"))
+    app.add_handler(CallbackQueryHandler(callback_sendexpert_mt4, pattern="^sendexpert_mt4$"))
+    app.add_handler(CallbackQueryHandler(callback_sendexpert_mt5, pattern="^sendexpert_mt5$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename))
 
     return app
